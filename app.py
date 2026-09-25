@@ -4,6 +4,9 @@ import urllib.request
 import urllib.error
 from urllib.parse import urlparse
 
+from google import genai
+from google.genai import types
+
 from flask import (
     Flask,
     render_template,
@@ -38,25 +41,24 @@ app.config["JSON_SORT_KEYS"] = False
 
 
 # ============================================================
-# OLLAMA CONFIGURATION
+# GEMINI CONFIGURATION
 # ============================================================
 
-OLLAMA_URL = os.environ.get(
-    "OLLAMA_URL",
-    "http://127.0.0.1:11434/api/chat",
+GEMINI_MODEL = os.environ.get(
+    "GEMINI_MODEL",
+    "gemini-3.8-flash",
 )
 
-OLLAMA_MODEL = os.environ.get(
-    "OLLAMA_MODEL",
-    "gemma3:4b",
-)
 
-OLLAMA_TIMEOUT = int(
-    os.environ.get(
-        "OLLAMA_TIMEOUT",
-        "180",
-    )
-)
+def get_gemini_client():
+    api_key = os.environ.get("GEMINI_API_KEY")
+
+    if not api_key:
+        raise RuntimeError(
+            "GEMINI_API_KEY is not configured on the server."
+        )
+
+    return genai.Client(api_key=api_key)
 
 
 # ============================================================
@@ -984,94 +986,72 @@ Source: {university_data.get("source") or "Not available"}
 
 
 # ============================================================
-# OLLAMA CHAT FUNCTION
+# GEMINI CHAT FUNCTION
 # ============================================================
 
-def ask_ollama(
-    messages,
-):
+def ask_gemini(messages):
     """
-    Directly talks to Ollama.
+    Sends the UniScout conversation to Gemini.
 
-    No ollama_client.py required.
-    No OllamaError required.
+    The existing message format is converted to Gemini's
+    Content/Part format so the rest of the application can
+    continue using its existing chat-history structure.
     """
 
-    payload = {
-        "model": OLLAMA_MODEL,
-        "messages": messages,
-        "stream": False,
-        "options": {
-            "temperature": 0.7,
-        },
-    }
+    client = get_gemini_client()
+    system_prompt = ""
+    contents = []
 
-    data = json.dumps(
-        payload
-    ).encode("utf-8")
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
 
-    request_object = urllib.request.Request(
-        OLLAMA_URL,
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
+        role = message.get("role")
+        content = message.get("content", "")
 
-    try:
+        if not content:
+            continue
 
-        with urllib.request.urlopen(
-            request_object,
-            timeout=OLLAMA_TIMEOUT,
-        ) as response:
+        if role == "system":
+            system_prompt = str(content)
+            continue
 
-            raw = response.read().decode(
-                "utf-8"
+        gemini_role = "model" if role == "assistant" else "user"
+
+        contents.append(
+            types.Content(
+                role=gemini_role,
+                parts=[
+                    types.Part.from_text(
+                        text=str(content)
+                    )
+                ],
             )
-
-            result = json.loads(raw)
-
-    except urllib.error.URLError as error:
-
-        raise RuntimeError(
-            "Ollama is not reachable. "
-            "Make sure Ollama is running on "
-            f"{OLLAMA_URL.replace('/api/chat', '')}."
-        ) from error
-
-    except TimeoutError as error:
-
-        raise RuntimeError(
-            "Ollama took too long to respond."
-        ) from error
-
-    except Exception as error:
-
-        raise RuntimeError(
-            f"Ollama request failed: {error}"
-        ) from error
-
-    message_data = result.get(
-        "message",
-        {},
-    )
-
-    response_text = message_data.get(
-        "content",
-        "",
-    )
-
-    if not response_text:
-
-        response_text = result.get(
-            "response",
-            "",
         )
 
-    return str(
-        response_text
-    ).strip()
+    try:
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                temperature=0.7,
+            ),
+        )
+
+        answer = (response.text or "").strip()
+
+        if not answer:
+            raise RuntimeError(
+                "Gemini returned an empty response."
+            )
+
+        return answer
+
+    except Exception as error:
+        raise RuntimeError(
+            f"Gemini request failed: {error}"
+        ) from error
 
 
 # ============================================================
@@ -1082,7 +1062,7 @@ AI_SYSTEM_PROMPT = """
 You are UniScout AI.
 
 You are a normal, friendly, helpful AI assistant powered by
-Google Gemma running locally through Ollama.
+Google Gemini through the Gemini API.
 
 You can talk about ANY normal topic.
 
@@ -1303,7 +1283,7 @@ Answer the user's question naturally.
         enhanced_message = message
 
     # ========================================================
-    # BUILD OLLAMA MESSAGES
+    # BUILD GEMINI MESSAGES
     # ========================================================
 
     messages = [
@@ -1332,7 +1312,7 @@ Answer the user's question naturally.
 
     try:
 
-        response = ask_ollama(
+        response = ask_gemini(
             messages
         )
 
@@ -1345,7 +1325,7 @@ Answer the user's question naturally.
         return jsonify(
             {
                 "response": response,
-                "model": OLLAMA_MODEL,
+                "model": GEMINI_MODEL,
             }
         )
 
@@ -1734,11 +1714,11 @@ def start_app():
     )
 
     print(
-        f"Ollama model: {OLLAMA_MODEL}"
+        f"Gemini model: {GEMINI_MODEL}"
     )
 
     print(
-        f"Ollama URL: {OLLAMA_URL}"
+        "Gemini API: configured through GEMINI_API_KEY"
     )
 
     print("=" * 70)
