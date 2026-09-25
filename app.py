@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import urllib.request
 import urllib.error
 from urllib.parse import urlparse
@@ -44,31 +45,31 @@ app.config["JSON_SORT_KEYS"] = False
 # GEMINI CONFIGURATION
 # ============================================================
 
-# Models are tried in order. If a model is temporarily unavailable
-# (for example 503/429), UniScout automatically tries the next one.
 GEMINI_MODELS = [
     os.environ.get("GEMINI_MODEL", "gemini-3.8-flash"),
     "gemini-3.7-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
 ]
 
-# Remove duplicates while keeping the configured model first.
+# Remove duplicates while preserving the order above.
 GEMINI_MODELS = list(dict.fromkeys(GEMINI_MODELS))
-GEMINI_MODEL = GEMINI_MODELS[0]
 
+gemini_client = None
 
 def get_gemini_client():
-    api_key = os.environ.get("GEMINI_API_KEY")
+    global gemini_client
 
-    if not api_key:
-        raise RuntimeError(
-            "GEMINI_API_KEY is not configured on the server."
-        )
+    if gemini_client is None:
+        if not os.environ.get("GEMINI_API_KEY"):
+            raise RuntimeError("GEMINI_API_KEY is not configured.")
+        gemini_client = genai.Client()
 
-    return genai.Client(api_key=api_key)
-
+    return gemini_client
 
 # ============================================================
 # TEMPLATE FILTERS
@@ -995,19 +996,49 @@ Source: {university_data.get("source") or "Not available"}
 
 
 # ============================================================
-# GEMINI CHAT FUNCTION
+# GEMINI CHAT FUNCTION WITH AUTOMATIC FALLBACK
 # ============================================================
+
+def _error_code(error):
+    """Best-effort extraction of the Gemini HTTP/API status code."""
+    code = getattr(error, "code", None)
+    if code is not None:
+        try:
+            return int(code)
+        except (TypeError, ValueError):
+            pass
+
+    response = getattr(error, "response", None)
+    response_code = getattr(response, "status_code", None)
+    if response_code is not None:
+        try:
+            return int(response_code)
+        except (TypeError, ValueError):
+            pass
+
+    text = str(error).lower()
+    for candidate in (503, 502, 500, 429, 408, 504):
+        if str(candidate) in text:
+            return candidate
+
+    return None
+
+
+def _is_retryable_gemini_error(error):
+    """Only retry/fallback for transient Gemini failures."""
+    return _error_code(error) in {408, 429, 500, 502, 503, 504}
+
 
 def ask_gemini(messages):
     """
-    Send the UniScout conversation to Gemini with automatic fallback.
+    Send the conversation to Gemini with real status-code handling.
 
-    If Gemini returns a temporary capacity/rate-limit error such as
-    503 UNAVAILABLE or 429 RESOURCE_EXHAUSTED, the function retries
-    the current model briefly and then tries the next model.
+    The google-genai SDK already retries transient failures internally.
+    If a request still fails with 408/429/500/502/503/504, UniScout
+    moves to the next configured model. Non-transient errors such as
+    invalid API keys or malformed requests are not retried.
     """
 
-    client = get_gemini_client()
     system_prompt = ""
     contents = []
 
@@ -1031,81 +1062,66 @@ def ask_gemini(messages):
             types.Content(
                 role=gemini_role,
                 parts=[
-                    types.Part.from_text(
-                        text=str(content)
-                    )
+                    types.Part.from_text(text=str(content))
                 ],
             )
         )
 
     if not contents:
-        raise RuntimeError("No message was provided to Gemini.")
+        raise RuntimeError("No user message was provided to Gemini.")
 
-    import time
+    errors = []
 
-    last_error = None
+    for index, model in enumerate(GEMINI_MODELS):
+        try:
+            print(f"Gemini: trying model {model}")
 
-    # A few short retries per model, then move to the next model.
-    retry_delays = (1, 2, 4)
+            response = get_gemini_client().models.generate_content(
+                model=model,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    temperature=0.7,
+                ),
+            )
 
-    for model in GEMINI_MODELS:
-        for attempt, delay in enumerate(retry_delays):
-            try:
-                response = client.models.generate_content(
-                    model=model,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_prompt,
-                    ),
+            answer = (response.text or "").strip()
+
+            if not answer:
+                raise RuntimeError(
+                    f"Gemini model {model} returned an empty response."
                 )
 
-                answer = (response.text or "").strip()
+            print(f"Gemini: model {model} succeeded")
+            return answer, model
 
-                if not answer:
-                    raise RuntimeError(
-                        f"Gemini model {model} returned an empty response."
-                    )
+        except Exception as error:
+            code = _error_code(error)
+            errors.append((model, code, str(error)))
 
-                # Store the model that actually answered this request.
-                global GEMINI_MODEL
-                GEMINI_MODEL = model
-                return answer
+            print(
+                f"Gemini: model {model} failed with status {code}: {error}"
+            )
 
-            except Exception as error:
-                last_error = error
-                error_text = str(error).upper()
+            if not _is_retryable_gemini_error(error):
+                raise RuntimeError(
+                    f"Gemini request failed ({model}): {error}"
+                ) from error
 
-                # Only fall back automatically for temporary service/rate
-                # limit errors. Configuration/authentication errors should
-                # be shown immediately instead of hiding the real problem.
-                temporary = any(
-                    marker in error_text
-                    for marker in (
-                        "503",
-                        "UNAVAILABLE",
-                        "429",
-                        "RESOURCE_EXHAUSTED",
-                        "500",
-                        "INTERNAL",
-                        "OVERLOADED",
-                        "HIGH DEMAND",
-                    )
-                )
+            # The SDK has already retried transient failures. Move to the
+            # next model after a short pause rather than hammering the API.
+            if index < len(GEMINI_MODELS) - 1:
+                time.sleep(0.5)
 
-                if not temporary:
-                    raise RuntimeError(
-                        f"Gemini request failed using {model}: {error}"
-                    ) from error
-
-                if attempt < len(retry_delays) - 1:
-                    time.sleep(delay)
-
-                # Otherwise try the next model.
+    summary = "; ".join(
+        f"{model}: HTTP {code if code is not None else 'unknown'}"
+        for model, code, _ in errors
+    )
 
     raise RuntimeError(
-        "All Gemini fallback models are temporarily unavailable. "
-        f"Last error: {last_error}"
-    ) from last_error
+        "All Gemini fallback models are currently unavailable. "
+        f"Attempts: {summary}. Please try again in a moment."
+    )
 
 
 # ============================================================
@@ -1361,12 +1377,12 @@ Answer the user's question naturally.
     )
 
     # ========================================================
-    # ASK GEMMA
+    # ASK GEMINI
     # ========================================================
 
     try:
 
-        response = ask_gemini(
+        response, model_used = ask_gemini(
             messages
         )
 
@@ -1379,7 +1395,7 @@ Answer the user's question naturally.
         return jsonify(
             {
                 "response": response,
-                "model": GEMINI_MODEL,
+                "model": model_used,
             }
         )
 
@@ -1769,10 +1785,6 @@ def start_app():
 
     print(
         f"Gemini models: {', '.join(GEMINI_MODELS)}"
-    )
-
-    print(
-        "Gemini API: configured through GEMINI_API_KEY"
     )
 
     print("=" * 70)
