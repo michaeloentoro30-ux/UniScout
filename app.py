@@ -44,10 +44,19 @@ app.config["JSON_SORT_KEYS"] = False
 # GEMINI CONFIGURATION
 # ============================================================
 
-GEMINI_MODEL = os.environ.get(
-    "GEMINI_MODEL",
-    "gemini-3.8-flash",
-)
+# Models are tried in order. If a model is temporarily unavailable
+# (for example 503/429), UniScout automatically tries the next one.
+GEMINI_MODELS = [
+    os.environ.get("GEMINI_MODEL", "gemini-3.8-flash"),
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+]
+
+# Remove duplicates while keeping the configured model first.
+GEMINI_MODELS = list(dict.fromkeys(GEMINI_MODELS))
+GEMINI_MODEL = GEMINI_MODELS[0]
 
 
 def get_gemini_client():
@@ -991,11 +1000,11 @@ Source: {university_data.get("source") or "Not available"}
 
 def ask_gemini(messages):
     """
-    Sends the UniScout conversation to Gemini.
+    Send the UniScout conversation to Gemini with automatic fallback.
 
-    The existing message format is converted to Gemini's
-    Content/Part format so the rest of the application can
-    continue using its existing chat-history structure.
+    If Gemini returns a temporary capacity/rate-limit error such as
+    503 UNAVAILABLE or 429 RESOURCE_EXHAUSTED, the function retries
+    the current model briefly and then tries the next model.
     """
 
     client = get_gemini_client()
@@ -1029,29 +1038,74 @@ def ask_gemini(messages):
             )
         )
 
-    try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                temperature=0.7,
-            ),
-        )
+    if not contents:
+        raise RuntimeError("No message was provided to Gemini.")
 
-        answer = (response.text or "").strip()
+    import time
 
-        if not answer:
-            raise RuntimeError(
-                "Gemini returned an empty response."
-            )
+    last_error = None
 
-        return answer
+    # A few short retries per model, then move to the next model.
+    retry_delays = (1, 2, 4)
 
-    except Exception as error:
-        raise RuntimeError(
-            f"Gemini request failed: {error}"
-        ) from error
+    for model in GEMINI_MODELS:
+        for attempt, delay in enumerate(retry_delays):
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_prompt,
+                    ),
+                )
+
+                answer = (response.text or "").strip()
+
+                if not answer:
+                    raise RuntimeError(
+                        f"Gemini model {model} returned an empty response."
+                    )
+
+                # Store the model that actually answered this request.
+                global GEMINI_MODEL
+                GEMINI_MODEL = model
+                return answer
+
+            except Exception as error:
+                last_error = error
+                error_text = str(error).upper()
+
+                # Only fall back automatically for temporary service/rate
+                # limit errors. Configuration/authentication errors should
+                # be shown immediately instead of hiding the real problem.
+                temporary = any(
+                    marker in error_text
+                    for marker in (
+                        "503",
+                        "UNAVAILABLE",
+                        "429",
+                        "RESOURCE_EXHAUSTED",
+                        "500",
+                        "INTERNAL",
+                        "OVERLOADED",
+                        "HIGH DEMAND",
+                    )
+                )
+
+                if not temporary:
+                    raise RuntimeError(
+                        f"Gemini request failed using {model}: {error}"
+                    ) from error
+
+                if attempt < len(retry_delays) - 1:
+                    time.sleep(delay)
+
+                # Otherwise try the next model.
+
+    raise RuntimeError(
+        "All Gemini fallback models are temporarily unavailable. "
+        f"Last error: {last_error}"
+    ) from last_error
 
 
 # ============================================================
@@ -1714,7 +1768,7 @@ def start_app():
     )
 
     print(
-        f"Gemini model: {GEMINI_MODEL}"
+        f"Gemini models: {', '.join(GEMINI_MODELS)}"
     )
 
     print(
